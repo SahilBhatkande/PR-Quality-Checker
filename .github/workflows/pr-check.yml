@@ -1,0 +1,101 @@
+name: PR Quality Check
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: './Backend/package-lock.json'
+
+    - name: Install Dependencies
+      working-directory: ./Backend
+      run: npm ci
+
+    - name: Run Linter
+      id: lint
+      working-directory: ./Backend
+      continue-on-error: true
+      run: |
+        npm run lint -- --format json -o lint-results.json || true
+        # Quick parsing for errors using jq
+        ERRORS=$(cat lint-results.json | jq '[.[] | .errorCount] | add')
+        WARNINGS=$(cat lint-results.json | jq '[.[] | .warningCount] | add')
+        echo "errors=$ERRORS" >> $GITHUB_OUTPUT
+        echo "warnings=$WARNINGS" >> $GITHUB_OUTPUT
+
+    - name: Run Tests
+      id: test
+      working-directory: ./Backend
+      continue-on-error: true
+      run: |
+        npx jest --json --outputFile=test-results.json || true
+        
+        TOTAL=$(cat test-results.json | jq '.numTotalTests')
+        PASSED=$(cat test-results.json | jq '.numPassedTests')
+        FAILED=$(cat test-results.json | jq '.numFailedTests')
+        
+        echo "total=$TOTAL" >> $GITHUB_OUTPUT
+        echo "passed=$PASSED" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+    - name: Notify Backend Webhook
+      env:
+        WEBHOOK_URL: ${{ secrets.BOT_WEBHOOK_URL }} # The deployed URL of our Node.js Backend app
+      run: |
+        if [ -z "$WEBHOOK_URL" ]; then
+          echo "No Webhook URL configured. Skipping backend notification."
+          exit 0
+        fi
+
+        # We construct the payload manually for the curl command
+        # Ideally, we would use a small node script, but for simplicity we can just POST JSON
+        curl -X POST "$WEBHOOK_URL/api/webhook" \
+        -H "Content-Type: application/json" \
+        -H "x-github-event: pull_request" \
+        -d '{
+          "action": "ci_completed",
+          "prDetails": {
+            "owner": "${{ github.repository_owner }}",
+            "repo": "${{ github.event.repository.name }}",
+            "prNumber": ${{ github.event.pull_request.number }},
+            "sha": "${{ github.event.pull_request.head.sha }}",
+            "author": "${{ github.event.pull_request.user.login }}",
+            "title": "${{ github.event.pull_request.title }}"
+          },
+          "lintResults": {
+            "errors": ${{ steps.lint.outputs.errors || 0 }},
+            "warnings": ${{ steps.lint.outputs.warnings || 0 }}
+          },
+          "testResults": {
+            "total": ${{ steps.test.outputs.total || 0 }},
+            "passed": ${{ steps.test.outputs.passed || 0 }},
+            "failed": ${{ steps.test.outputs.failed || 0 }}
+          }
+        }'
+
+    - name: Fail pipeline if checks failed
+      run: |
+        ERRORS=${{ steps.lint.outputs.errors || 0 }}
+        FAILED_TESTS=${{ steps.test.outputs.failed || 0 }}
+        
+        if [ "$ERRORS" -gt 0 ] || [ "$FAILED_TESTS" -gt 0 ]; then
+          echo "Pipeline failed! Lint errors: $ERRORS, Failed tests: $FAILED_TESTS"
+          exit 1
+        else
+          echo "All checks passed successfully."
+        fi
